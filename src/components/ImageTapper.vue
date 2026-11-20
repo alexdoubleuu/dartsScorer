@@ -132,7 +132,12 @@ function onPointerDown(event: PointerEvent): void {
   activePointer.value = event.pointerId;
   dragId.value = markerNear(imagePoint, box)?.id ?? null;
 
-  if (typeof stage.setPointerCapture === 'function') stage.setPointerCapture(event.pointerId);
+  // Capture on the element that owns these handlers. Pointer capture retargets
+  // move/up events to the capturing element, so capturing on an ancestor (the
+  // stage) would stop this element from ever seeing the pointer up - and the
+  // tap would be lost.
+  const hit = event.currentTarget as HTMLElement | null;
+  if (hit && typeof hit.setPointerCapture === 'function') hit.setPointerCapture(event.pointerId);
   event.preventDefault();
 }
 
@@ -167,9 +172,9 @@ function onPointerUp(event: PointerEvent): void {
   dragId.value = null;
   dragMoved.value = false;
 
-  const stage = stageRef.value;
-  if (stage && typeof stage.releasePointerCapture === 'function') {
-    stage.releasePointerCapture(event.pointerId);
+  const hit = event.currentTarget as HTMLElement | null;
+  if (hit && typeof hit.releasePointerCapture === 'function') {
+    hit.releasePointerCapture(event.pointerId);
   }
   if (!box) return;
 
