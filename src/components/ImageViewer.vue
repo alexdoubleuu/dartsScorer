@@ -482,6 +482,7 @@ function markerClass(marker: TapperMarker): Record<string, boolean> {
       @pointermove="onPointerMove"
       @pointerup="onPointerUp"
       @pointercancel="onPointerCancel"
+      @contextmenu.prevent
     >
       <div class="layer" :style="layerStyle">
         <img
@@ -653,11 +654,19 @@ function markerClass(marker: TapperMarker): Record<string, boolean> {
      browser's default behaviour (page zoom is NOT disabled globally). */
   touch-action: none;
   overscroll-behavior: contain;
+  /* A long press or force touch must not open the native callout ("Save
+     image", "Copy", a peek preview) or start a text selection - they would
+     steal the gesture and, on iOS, show the system magnifier on top of ours.
+     `touch-action` does not cover this; it is a callout/selection behaviour. */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .layer {
   position: absolute;
   transform-origin: 0 0;
+  pointer-events: none;
 }
 
 .photo,
@@ -671,8 +680,13 @@ function markerClass(marker: TapperMarker): Record<string, boolean> {
 
 .photo {
   object-fit: fill;
+  /* Never the hit target: the photo is a texture, not a control. This keeps
+     iOS from treating the long press as "press on an image", and every touch
+     is delivered to `.viewport`, which owns the gesture handlers. */
+  pointer-events: none;
   user-select: none;
   -webkit-user-drag: none;
+  -webkit-touch-callout: none;
 }
 
 .overlay,
