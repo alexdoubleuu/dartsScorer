@@ -33,9 +33,11 @@ body {
 }
 
 #app {
-  max-width: 720px;
-  margin: 0 auto;
-  padding: max(12px, env(safe-area-inset-top)) 12px calc(24px + env(safe-area-inset-bottom));
+  /* Phone-first shell: the app owns the whole viewport and each screen places
+     its own safe-area padding. The board image is the main content, so it gets
+     the full width instead of being boxed into a narrow column. */
+  height: 100dvh;
+  overflow: hidden;
 }
 
 h1 {

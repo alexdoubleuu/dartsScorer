@@ -1,16 +1,26 @@
 import type { Size } from '../types';
 
+/** Identity of the camera a frame came from, when the browser exposes it. */
+export interface FrameCamera {
+  deviceId: string | null;
+  label: string | null;
+}
+
 /**
  * A frozen frame - the single image that everything downstream works on.
  *
  * `url` is an object URL owned by this module: call `releaseFrame` when the
  * frame is replaced or unmounted.
+ *
+ * `camera` is recorded so a stored calibration can be tied to the device it was
+ * measured on: the same phone with a different lens is a different geometry.
  */
 export interface Frame {
   url: string;
   width: number;
   height: number;
   origin: 'camera' | 'upload';
+  camera?: FrameCamera | null;
 }
 
 export const MAX_UPLOAD_DIMENSION = 2400;
@@ -104,7 +114,10 @@ export function releaseFrame(frame: Frame | null | undefined): void {
 }
 
 /** Draw the current video frame into a frozen Frame. */
-export async function frameFromVideo(video: HTMLVideoElement): Promise<Frame> {
+export async function frameFromVideo(
+  video: HTMLVideoElement,
+  camera: FrameCamera | null = null,
+): Promise<Frame> {
   const width = video.videoWidth;
   const height = video.videoHeight;
   if (!width || !height) {
@@ -116,5 +129,5 @@ export async function frameFromVideo(video: HTMLVideoElement): Promise<Frame> {
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('Could not get a 2D canvas context to capture the frame.');
   ctx.drawImage(video, 0, 0, width, height);
-  return { ...(await canvasToFrame(canvas)), origin: 'camera' };
+  return { ...(await canvasToFrame(canvas)), origin: 'camera', camera };
 }

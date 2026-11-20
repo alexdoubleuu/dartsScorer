@@ -17,7 +17,20 @@ import { CALIBRATION_REFS } from '../geometry/calibration';
  * from the verified board model in `boardModel.ts`, so the positions shown here
  * are the same geometry the scoring code uses. Tap target 1 is drawn where the
  * 20/1 wire crosses the OUTER edge of the double ring, and so on round.
+ *
+ * `activeIndex` highlights the single reference being placed, so the wizard can
+ * show one point at a time; `compact` drops the caption for a small inline
+ * diagram.
  */
+
+interface Props {
+  /** 0-based reference to emphasise. Others are dimmed when this is set. */
+  activeIndex?: number | null;
+  /** Hide caption and legend, for a small inline diagram. */
+  compact?: boolean;
+}
+
+const props = withDefaults(defineProps<Props>(), { activeIndex: null, compact: false });
 
 const VIEW = 220;
 const CENTRE = VIEW / 2;
@@ -67,7 +80,7 @@ const targets = CALIBRATION_REFS.map((ref, i) => ({
 </script>
 
 <template>
-  <figure class="schematic">
+  <figure class="schematic" :class="{ 'schematic--compact': props.compact }">
     <svg :viewBox="`0 0 ${VIEW} ${VIEW}`" role="img" aria-label="Where to tap the four calibration points">
       <circle :cx="CENTRE" :cy="CENTRE" :r="ringRadius(BOARD_MM.doubleOuterRadius)" class="schematic-board" />
 
@@ -93,7 +106,15 @@ const targets = CALIBRATION_REFS.map((ref, i) => ({
 
       <text v-for="n in numbers" :key="n.key" :x="n.x" :y="n.y" class="board-number">{{ n.number }}</text>
 
-      <g v-for="t in targets" :key="t.key">
+      <g
+        v-for="t in targets"
+        :key="t.key"
+        :class="{
+          'schematic-target-group--active': props.activeIndex === t.index - 1,
+          'schematic-target-group--dim':
+            props.activeIndex !== null && props.activeIndex !== t.index - 1,
+        }"
+      >
         <circle :cx="t.x" :cy="t.y" r="7" class="schematic-target" />
         <line :x1="t.x - 10" :y1="t.y" :x2="t.x + 10" :y2="t.y" class="schematic-target-cross" />
         <line :x1="t.x" :y1="t.y - 10" :x2="t.x" :y2="t.y + 10" class="schematic-target-cross" />
@@ -101,7 +122,7 @@ const targets = CALIBRATION_REFS.map((ref, i) => ({
       </g>
     </svg>
 
-    <figcaption>
+    <figcaption v-if="!props.compact">
       <p class="muted">
         Plan view of a standard steel-tip board. Tap the four red crosses <strong>in order 1 to 4</strong>,
         each where the radial wire crosses the outer edge of the double ring.
@@ -160,5 +181,28 @@ const targets = CALIBRATION_REFS.map((ref, i) => ({
 
 .schematic-legend strong {
   color: var(--text);
+}
+
+.schematic--compact svg {
+  max-width: 128px;
+  margin-bottom: 0;
+}
+
+.schematic-target-group--dim {
+  opacity: 0.26;
+}
+
+.schematic-target-group--active .schematic-target {
+  fill: rgba(45, 212, 191, 0.3);
+  stroke: var(--accent);
+}
+
+.schematic-target-group--active .schematic-target-cross {
+  stroke: var(--accent);
+  stroke-width: 2.2;
+}
+
+.schematic-target-group--active .schematic-target-index {
+  fill: var(--accent);
 }
 </style>

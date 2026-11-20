@@ -40,6 +40,15 @@ export interface DartScore {
 export interface MarkedDart {
   id: string;
   point: Point;
+  /**
+   * A score the user set directly, which wins over the geometric score.
+   *
+   * Deliberately a separate field from `point`: correcting a mis-scored dart is
+   * a scoring change, not a request to move the marked coordinate, so the two
+   * must never be conflated. `undefined` means "no override, use geometry";
+   * `null` is not used here to keep the "is there an override" test obvious.
+   */
+  override?: DartScore;
 }
 
 export interface ScoredDart extends MarkedDart {
@@ -53,6 +62,8 @@ export interface ScoredDart extends MarkedDart {
  */
 export interface DartEntry extends MarkedDart {
   score: DartScore | null;
+  /** True when `score` came from a manual override rather than the geometry. */
+  corrected: boolean;
 }
 
 const MISS: DartScore = { segment: 'MISS', multiplier: 1, score: 0, label: 'MISS', ring: 'off-board' };
@@ -101,3 +112,52 @@ export function scoreImagePoint(calibration: Calibration, imagePoint: Point): Da
 export function sumScores(scores: readonly DartScore[]): number {
   return scores.reduce((total, s) => total + s.score, 0);
 }
+
+/** The multipliers a manual correction can choose. */
+export const MULTIPLIERS = [1, 2, 3] as const;
+
+export type Multiplier = (typeof MULTIPLIERS)[number];
+
+/** Segment choices offered by the correction picker: 1-20, bull and a miss. */
+export const CORRECTABLE_SEGMENTS: readonly SegmentId[] = [
+  ...Array.from({ length: 20 }, (_, i) => i + 1),
+  'BULL',
+  'MISS',
+];
+
+/**
+ * Whether a multiplier is meaningful for a segment. Trebles only exist for
+ * numbered wedges; a miss has no multiplier at all.
+ */
+export function isValidSelection(segment: SegmentId, multiplier: Multiplier): boolean {
+  if (segment === 'MISS') return multiplier === 1;
+  if (segment === 'BULL') return multiplier === 1 || multiplier === 2;
+  return true;
+}
+
+/**
+ * Build the score a manual correction selected.
+ *
+ * A "single" has no way to say inner vs outer band from a segment-and-multiplier
+ * choice, so the inner single band is used: the points value is identical, and
+ * the picker never claims more precision than the user gave it.
+ */
+export function scoreFromSelection(segment: SegmentId, multiplier: Multiplier): DartScore {
+  if (segment === 'MISS') return { ...MISS };
+  if (segment === 'BULL') {
+    return multiplier === 2
+      ? { segment: 'BULL', multiplier: 1, score: 50, label: 'BULL', ring: 'inner-bull' }
+      : { segment: 'BULL', multiplier: 1, score: 25, label: '25', ring: 'outer-bull' };
+  }
+  const ring: RingId = multiplier === 3 ? 'treble' : multiplier === 2 ? 'double' : 'inner-single';
+  const prefix = multiplier === 3 ? 'T' : multiplier === 2 ? 'D' : 'S';
+  return { segment, multiplier, score: segment * multiplier, label: `${prefix}${segment}`, ring };
+}
+
+/** The multiplier a score was recorded with, mapped back for the picker. */
+export function multiplierOf(score: DartScore | null): Multiplier {
+  if (!score) return 1;
+  if (score.segment === 'BULL') return score.score >= 50 ? 2 : 1;
+  return score.multiplier;
+}
+

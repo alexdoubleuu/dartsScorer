@@ -152,7 +152,9 @@ export function useCamera(videoRef: Ref<HTMLVideoElement | null>): UseCameraApi 
     if (!el || status.value !== 'live') {
       throw new Error('The camera is not running.');
     }
-    return frameFromVideo(el);
+    const deviceId = activeDeviceId.value;
+    const label = inputs.value.find((input) => input.deviceId === deviceId)?.label ?? null;
+    return frameFromVideo(el, { deviceId: deviceId ?? null, label });
   }
 
   onScopeDispose(stop);
