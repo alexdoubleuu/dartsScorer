@@ -5,3 +5,6 @@ dist-ssr
 .vite
 .DS_Store
 *.tsbuildinfo
+
+# Local ML sandbox for exporting/validating the dart detector. Never shipped.
+.ml-lab

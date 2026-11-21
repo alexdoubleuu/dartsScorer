@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import ImageViewer from './ImageViewer.vue';
 import type { RingId } from '../board/boardModel';
 import type { Frame } from '../camera/frame';
+import type { DetectionDiagnostics } from '../detector/debugExport';
 import type { Calibration } from '../geometry/calibration';
 import type { ViewState } from '../geometry/viewTransform';
 import { sumScores, type DartEntry } from '../scoring/score';
@@ -15,8 +16,10 @@ import type { Point, TapperMarker } from '../types';
  * per-dart corrections - lives in one compact bar and a collapsible bottom
  * sheet, so the image is never permanently shrunk to make room for chrome.
  *
- * Manual marking is a deliberate mode here, not the default flow: with it off,
- * a tap on the board does nothing at all, because there is no detector to feed.
+ * Detect runs the real bundled detector; every detection becomes an ordinary
+ * dart. Manual mode doubles as the debug mode: it reveals the full candidate
+ * list with confidences and the timings, and offers the overlay/JSON exports
+ * used to check detection on a phone.
  */
 
 interface Props {
@@ -31,9 +34,23 @@ interface Props {
   activeId?: string | null;
   statusLabel: string;
   statusDetail: string;
+  /** A detection is in flight. */
+  detecting?: boolean;
+  /** The last detection failure, shown prominently. */
+  detectError?: string | null;
+  /** Record of the last Detect press, shown in debug mode. */
+  diagnostics?: DetectionDiagnostics | null;
+  /** More darts are marked than a visit scores. */
+  needsReview?: boolean;
 }
 
-const props = defineProps<Props>();
+const props = withDefaults(defineProps<Props>(), {
+  activeId: null,
+  detecting: false,
+  detectError: null,
+  diagnostics: null,
+  needsReview: false,
+});
 
 const emit = defineEmits<{
   place: [point: Point];
@@ -44,8 +61,11 @@ const emit = defineEmits<{
   'fix-score': [id: string];
   undo: [];
   reset: [];
+  detect: [];
   'toggle-manual': [];
   'new-photo': [];
+  'export-overlay': [];
+  'export-json': [];
 }>();
 
 const RING_TEXT: Record<RingId, string> = {
@@ -61,8 +81,19 @@ const RING_TEXT: Record<RingId, string> = {
 const sheetOpen = ref(false);
 const fullscreen = ref(false);
 
+// Manual mode is the debug mode: opening it reveals the detection diagnostics,
+// so bring the sheet up with it.
+watch(
+  () => props.manualMode,
+  (manual) => {
+    if (manual) sheetOpen.value = true;
+  },
+);
+
 const total = computed(() => sumScores(props.entries.flatMap((entry) => (entry.score ? [entry.score] : []))));
 const selectedId = computed(() => props.activeId ?? null);
+const diagnostics = computed(() => props.diagnostics ?? null);
+const candidateCount = computed(() => diagnostics.value?.candidates.length ?? 0);
 
 /** Three fixed slots so the visit reads the same shape all the way through. */
 const slots = computed(() =>
@@ -78,10 +109,12 @@ const slots = computed(() =>
 );
 
 const hint = computed(() => {
+  if (props.detecting) return 'Running the detector on this photo...';
   if (!props.manualMode) {
-    return 'Automatic dart detection is not implemented. Switch on Manual marking to enter darts by hand.';
+    return 'Press Detect to find the darts on this photo, or switch on Manual to place them by hand.';
   }
   if (selectedId.value) return 'Drag the marker, or nudge it with the pad. Tap empty board to place the next dart.';
+  if (props.needsReview) return 'More markers than a visit. Remove the extras from the sheet, or fix their scores.';
   if (props.entries.length >= props.maxDarts) return 'Three darts marked. Fix a score, undo, or reset for the next visit.';
   return 'Tap the board where the dart entered. A magnifier appears so your finger never hides the point.';
 });
@@ -90,12 +123,19 @@ function onPlace(point: Point): void {
   if (!props.manualMode) return;
   emit('place', point);
 }
+
+function formatConfidence(value: number | null): string {
+  return value === null ? 'n/a' : value.toFixed(3);
+}
 </script>
 
 <template>
   <div class="play" :class="{ 'play--full': fullscreen }">
     <header class="play-bar">
       <span class="status-chip" :title="statusDetail">{{ statusLabel }}</span>
+      <button class="tiny primary" :disabled="detecting" @click="emit('detect')">
+        {{ detecting ? 'Detecting...' : 'Detect' }}
+      </button>
       <button
         class="tiny"
         :class="{ primary: manualMode, ghost: !manualMode }"
@@ -114,6 +154,13 @@ function onPlace(point: Point): void {
       </button>
       <button class="tiny ghost" aria-label="Take a new photo" @click="emit('new-photo')">New photo</button>
     </header>
+
+    <p v-if="detectError" class="play-error" role="alert">{{ detectError }}</p>
+
+    <p v-if="needsReview" class="play-review" role="status">
+      {{ entries.length }} darts are marked but a visit scores {{ maxDarts }}. This result needs
+      review: open the sheet and remove the extra markers, or fix their scores.
+    </p>
 
     <div class="play-body">
       <ImageViewer
@@ -190,6 +237,40 @@ function onPlace(point: Point): void {
           <button class="danger" :disabled="entries.length === 0" @click="emit('reset')">Reset visit</button>
         </div>
 
+        <section v-if="manualMode" class="debug">
+          <h2 class="debug-title">Detection diagnostics</h2>
+          <p v-if="!diagnostics" class="muted">No detection has run on this photo yet. Press Detect.</p>
+          <template v-else>
+            <dl class="debug-grid">
+              <div><dt>Source</dt><dd>{{ diagnostics.imageWidth }} x {{ diagnostics.imageHeight }} px</dd></div>
+              <div><dt>Model load</dt><dd>{{ diagnostics.modelLoadMs }} ms</dd></div>
+              <div><dt>Inference</dt><dd>{{ diagnostics.inferenceMs }} ms</dd></div>
+              <div><dt>Whole Detect</dt><dd>{{ diagnostics.totalMs }} ms</dd></div>
+              <div><dt>Candidates</dt><dd>{{ candidateCount }}</dd></div>
+              <div><dt>Marked</dt><dd>{{ entries.length }}</dd></div>
+            </dl>
+
+            <ul class="debug-list">
+              <li v-for="(candidate, index) in diagnostics.candidates" :key="index">
+                <span class="debug-index">#{{ index + 1 }}</span>
+                <span class="debug-conf">{{ formatConfidence(candidate.confidence) }}</span>
+                <span class="debug-xy">
+                  {{ candidate.point.x.toFixed(1) }}, {{ candidate.point.y.toFixed(1) }} px
+                </span>
+              </li>
+            </ul>
+
+            <p v-if="diagnostics.errors.length" class="debug-errors">
+              {{ diagnostics.errors.join('; ') }}
+            </p>
+
+            <div class="sheet-actions">
+              <button class="ghost" @click="emit('export-overlay')">Save overlay PNG</button>
+              <button class="ghost" @click="emit('export-json')">Save predictions</button>
+            </div>
+          </template>
+        </section>
+
         <p class="muted sheet-note">
           {{ statusDetail }} Resetting the visit keeps the calibration, so the next three darts can be
           marked on the same board.
@@ -227,6 +308,28 @@ function onPlace(point: Point): void {
 
 .play-bar .status-chip {
   flex: 1 1 auto;
+}
+
+.play-error {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--danger, #f85149);
+  background: rgba(248, 81, 73, 0.12);
+  color: var(--danger, #f85149);
+  font-size: 0.8rem;
+}
+
+.play-review {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid #d29922;
+  background: rgba(210, 153, 34, 0.14);
+  color: #e3b341;
+  font-size: 0.8rem;
 }
 
 .play-body {
@@ -421,5 +524,86 @@ function onPlace(point: Point): void {
 
 .sheet-note {
   margin-top: 10px;
+}
+
+/* ------------------------------------------------------------ debug panel -- */
+
+.debug {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+}
+
+.debug-title {
+  margin: 0 0 8px;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.debug-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+  margin: 0 0 10px;
+}
+
+.debug-grid div {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 0.76rem;
+}
+
+.debug-grid dt {
+  color: var(--muted);
+}
+
+.debug-grid dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.debug-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 30dvh;
+  overflow-y: auto;
+}
+
+.debug-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 0.78rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.debug-index {
+  width: 26px;
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.debug-conf {
+  width: 48px;
+  flex: 0 0 auto;
+  font-weight: 700;
+  color: var(--dart);
+  font-variant-numeric: tabular-nums;
+}
+
+.debug-xy {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.debug-errors {
+  margin: 8px 0 0;
+  font-size: 0.78rem;
+  color: var(--danger, #f85149);
 }
 </style>

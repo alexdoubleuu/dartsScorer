@@ -1,18 +1,19 @@
 import type { Point, Size } from '../types';
+import { createYolov8DartDetector } from './yolov8Detector';
 
 /**
  * ---------------------------------------------------------------------------
- * FUTURE AUTOMATIC DETECTOR - INTERFACE ONLY, NOT IMPLEMENTED
+ * AUTOMATIC DETECTOR BOUNDARY
  * ---------------------------------------------------------------------------
- * Nothing in the current milestone implements this. There is no model file, no
- * weights, no inference runtime and no download URL anywhere in this project,
- * and none may be invented. The manual marking UI is explicitly labelled as
- * manual and must never be presented as AI output.
+ * `yolov8Detector.ts` is a real, on-device detector: a trained YOLOv8 model
+ * run with onnxruntime-web from a file bundled with this app. It is listed in
+ * `AVAILABLE_DETECTORS` below, so `hasAutomatedDetector()` is now true and the
+ * UI may honestly claim detection is available.
  *
- * When a real model is chosen, ONNX Runtime Web is the intended runtime, and
- * the model must be bundled or fetched from a source the user controls. Until
- * then this file only pins down the *shape* of the boundary so the manual
- * pipeline can be wired up without a later rewrite.
+ * The interface still exists for a reason: a detector that returns placeholder
+ * boxes, a mock, or a hand-entered tap is NOT a detector, and must never be
+ * registered here. Manual marking continues to be a separate, explicitly
+ * labelled mode.
  *
  * DESIGN NOTE - why entry points, not bounding boxes:
  * Scoring needs the exact point at which the dart tip meets the board face.
@@ -20,6 +21,16 @@ import type { Point, Size } from '../types';
  * useless for scoring: the box centroid of a dart lying across the 20 wire is
  * nowhere near its entry point. A detector must therefore report a single
  * board-entry coordinate per dart, plus an optional confidence.
+ *
+ * EVIDENCE - what these weights actually annotate:
+ * The `dart-sense` training labels are point annotations, not object extents.
+ * Every box in the dataset labels has the identical tiny size (w = h = 0.025
+ * of the image, about 20 px at 800), for the dart class and for the printed
+ * number-glyph classes alike. The model author's own scoring script reads a
+ * dart's position as that box's CENTRE (`box.xywhn` -> x_centre, y_centre), see
+ * `.ml-lab/reference_predict.py`. So for these weights the box centre IS the
+ * annotated dart landing point, which is exactly what `DartDetection.point`
+ * must carry - and taking the centre is correct, not an approximation.
  */
 
 export interface DartDetection {
@@ -71,11 +82,13 @@ export interface DartDetector {
 }
 
 /**
- * The registry is intentionally empty: there is no detector available yet.
- * `runDetector` therefore always rejects, so no caller can accidentally treat
- * manual input as automated output.
+ * The detectors this build can actually run. Currently one: the bundled
+ * YOLOv8 model. Its weights and wasm backend load lazily on first `load()`.
  */
-export const AVAILABLE_DETECTORS: readonly DartDetector[] = [];
+export const AVAILABLE_DETECTORS: readonly DartDetector[] = [createYolov8DartDetector()];
+
+/** The detector used when the user presses Detect. */
+export const DEFAULT_DETECTOR_ID = 'yolov8-dart-sense-onnx-800';
 
 export function getDetector(_id: string): DartDetector | null {
   return AVAILABLE_DETECTORS.find((d) => d.id === _id) ?? null;

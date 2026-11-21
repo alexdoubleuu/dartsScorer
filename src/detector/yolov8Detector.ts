@@ -1,0 +1,183 @@
+import type { InferenceSession } from 'onnxruntime-web';
+import type { DartDetection, DartDetector, DetectInput, DetectorContext } from './Detector';
+import {
+  LETTERBOX_PAD,
+  decodeYolov8,
+  letterboxGeometry,
+  mapLetterboxedToSource,
+  type LetterboxGeometry,
+} from './yolov8';
+
+/**
+ * ---------------------------------------------------------------------------
+ * YOLOv8 DART DETECTOR (REAL, ON-DEVICE)
+ * ---------------------------------------------------------------------------
+ * Runs a trained YOLOv8 model in the browser with onnxruntime-web and turns
+ * its output into the single thing scoring needs: the point where each dart
+ * entered the board face, in source-image pixel coordinates.
+ *
+ * Model: `dart-sense` (Ben Willshaw, CC BY-NC 4.0), exported to ONNX here at
+ * imgsz 800 / opset 12. Classes are
+ *   {0:'20', 1:'3', 2:'11', 3:'6', 4:'dart', 5:'9', 6:'15'}.
+ * Only class 4 is used: this app keeps its own four-point calibration, so the
+ * model's calibration classes are ignored rather than mixed with it.
+ *
+ * Everything is loaded lazily: onnxruntime-web and the ~11 MB wasm backend are
+ * only fetched when `load()` is first called, so the app still starts on a
+ * phone without paying for a model nobody has asked to run.
+ */
+
+type Ort = typeof import('onnxruntime-web');
+
+const MODEL_URL = `${import.meta.env.BASE_URL}models/dart-detector.onnx`;
+const WASM_DIR = `${import.meta.env.BASE_URL}ort/`;
+
+/** Square input side the model was exported at. */
+const IMGSZ = 800;
+/** Class index of "dart" in this checkpoint. */
+const DART_CLASS = 4;
+/**
+ * Ultralytics' own `predict()` defaults, which are what the model author's
+ * pipeline (`get_scores.py`) relies on. Keeping the same two numbers here is
+ * what makes the browser output comparable with the reference run in
+ * `.ml-lab/reference_predict.py`.
+ */
+const DART_CONFIDENCE = 0.25;
+const IOU_THRESHOLD = 0.7;
+
+class Yolov8DartDetector implements DartDetector {
+  readonly id = 'yolov8-dart-sense-onnx-800';
+  readonly name = 'Dart detector (YOLOv8, on device)';
+  readonly isAutomated = true as const;
+
+  private ort: Ort | null = null;
+  private session: InferenceSession | null = null;
+  private loading: Promise<void> | null = null;
+
+  async load(_context: DetectorContext): Promise<void> {
+    if (this.session) return;
+    if (this.loading) return this.loading;
+
+    this.loading = (async () => {
+      let ort: Ort;
+      try {
+        ort = await import('onnxruntime-web');
+      } catch (cause) {
+        throw new Error(
+          `Could not load the inference runtime (onnxruntime-web): ${messageOf(cause)}`,
+        );
+      }
+
+      // A single-threaded wasm backend needs no SharedArrayBuffer, so it works
+      // on a plain static host and on a phone without cross-origin isolation.
+      ort.env.wasm.wasmPaths = WASM_DIR;
+      ort.env.wasm.numThreads = 1;
+      ort.env.wasm.simd = true;
+
+      try {
+        this.session = await ort.InferenceSession.create(MODEL_URL, {
+          executionProviders: ['wasm'],
+          graphOptimizationLevel: 'all',
+        });
+      } catch (cause) {
+        throw new Error(
+          `Could not load the dart detection model from ${MODEL_URL}: ${messageOf(cause)}`,
+        );
+      }
+      this.ort = ort;
+    })();
+
+    try {
+      await this.loading;
+    } finally {
+      this.loading = null;
+    }
+  }
+
+  async detect(input: DetectInput): Promise<DartDetection[]> {
+    const ort = this.ort;
+    const session = this.session;
+    if (!ort || !session) throw new Error('Detector used before load() finished.');
+
+    const geometry = letterboxGeometry(input.imageSize, IMGSZ);
+    const values = buildInputTensor(input, geometry);
+    const tensor = new ort.Tensor('float32', values, [1, 3, IMGSZ, IMGSZ]);
+
+    const inputName = session.inputNames[0];
+    const results = await session.run({ [inputName]: tensor });
+    const output = results[session.outputNames[0]];
+
+    const dims = output.dims as [number, number, number];
+    const channels = dims[1];
+    const anchors = dims[2];
+
+    const raw = decodeYolov8(output.data as Float32Array, {
+      channels,
+      anchors,
+      classCount: channels - 4,
+      confidenceThreshold: DART_CONFIDENCE,
+      iouThreshold: IOU_THRESHOLD,
+    });
+
+    return raw
+      .filter((candidate) => candidate.classId === DART_CLASS)
+      .map((candidate) => ({
+        // These weights annotate each dart as a tiny point box whose centre is
+        // the dart's landing point - the author's own pipeline reads a dart's
+        // position as `box.xywhn` centre (`reference_predict.py`). The decoded
+        // box centre is therefore the entry point, not a box-centroid
+        // approximation of a dart-shaped object.
+        point: mapLetterboxedToSource({ x: candidate.cx, y: candidate.cy }, geometry),
+        confidence: candidate.confidence,
+        tailHint: null,
+      }));
+  }
+
+  async dispose(): Promise<void> {
+    await this.session?.release();
+    this.session = null;
+    this.ort = null;
+  }
+}
+
+/**
+ * Letterbox the source pixels into a square RGB tensor, exactly as the
+ * reference implementation does: scale to fit, centre on a grey 114 canvas,
+ * convert to 0..1 and lay channels out planar (NCHW).
+ */
+function buildInputTensor(input: DetectInput, geometry: LetterboxGeometry): Float32Array {
+  const source = document.createElement('canvas');
+  source.width = input.imageSize.width;
+  source.height = input.imageSize.height;
+  const sourceContext = source.getContext('2d', { willReadFrequently: true });
+  if (!sourceContext) throw new Error('Could not get a 2D canvas context to preprocess the photo.');
+  sourceContext.putImageData(input.imageData, 0, 0);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = IMGSZ;
+  canvas.height = IMGSZ;
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) throw new Error('Could not get a 2D canvas context to preprocess the photo.');
+  context.fillStyle = `rgb(${LETTERBOX_PAD}, ${LETTERBOX_PAD}, ${LETTERBOX_PAD})`;
+  context.fillRect(0, 0, IMGSZ, IMGSZ);
+  context.drawImage(source, geometry.left, geometry.top, geometry.newWidth, geometry.newHeight);
+
+  const { data } = context.getImageData(0, 0, IMGSZ, IMGSZ);
+  const plane = IMGSZ * IMGSZ;
+  const values = new Float32Array(3 * plane);
+  for (let i = 0; i < plane; i += 1) {
+    values[i] = data[i * 4] / 255;
+    values[plane + i] = data[i * 4 + 1] / 255;
+    values[2 * plane + i] = data[i * 4 + 2] / 255;
+  }
+  return values;
+}
+
+function messageOf(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}
+
+/** Build the detector. The session is created only when `load()` is called. */
+export function createYolov8DartDetector(): DartDetector {
+  return new Yolov8DartDetector();
+}
