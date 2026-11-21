@@ -1,4 +1,5 @@
 import type { Point, Size } from '../types';
+import type { CropRect, FrameMode } from './crop';
 import { createYolov8DartDetector } from './yolov8Detector';
 
 /**
@@ -80,6 +81,16 @@ export interface DetectorTrace {
     letterboxPad: number;
     layout: 'NCHW';
   };
+  /**
+   * Which framing this press actually used. `cropRect` is null whenever the
+   * whole frame was fed to the model, so the record never claims a crop that
+   * was not applied.
+   */
+  frame: {
+    mode: FrameMode;
+    cropRect: CropRect | null;
+    padRatio: number;
+  };
   timings: {
     preprocessingMs: number;
     inferenceMs: number;
@@ -88,12 +99,20 @@ export interface DetectorTrace {
   candidates: DetectorTraceCandidate[];
 }
 
-export type DetectorSettings = Omit<DetectorTrace, 'candidates' | 'timings'>;
+export type DetectorSettings = Omit<DetectorTrace, 'candidates' | 'timings' | 'frame'>;
 
 export interface DetectInput {
   /** The frozen frame to analyse, in the same coordinate system as calibration. */
   imageData: ImageData;
   imageSize: Size;
+  /**
+   * Board crop in source-image pixels, or null/omitted for the whole frame.
+   * Detections are mapped back through the crop, so this never changes the
+   * coordinate system `DartDetection.point` is reported in.
+   */
+  crop?: CropRect | null;
+  /** Framing requested by the caller; recorded in the trace and debug export. */
+  frameMode?: FrameMode;
 }
 
 export interface DetectorContext {

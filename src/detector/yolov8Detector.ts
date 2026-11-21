@@ -15,6 +15,7 @@ import {
   traceDartCandidates,
   type LetterboxGeometry,
 } from './yolov8';
+import { BOARD_CROP_PAD, cropToSourcePoint, type CropRect } from './crop';
 
 /**
  * ---------------------------------------------------------------------------
@@ -110,9 +111,12 @@ class Yolov8DartDetector implements DartDetector {
     if (!ort || !session) throw new Error('Detector used before load() finished.');
     this.clearLastTrace();
 
+    const crop = input.crop ?? null;
+    const region = crop ? { width: crop.width, height: crop.height } : input.imageSize;
+
     const preprocessingStart = performance.now();
-    const geometry = letterboxGeometry(input.imageSize, IMGSZ);
-    const values = buildInputTensor(input, geometry);
+    const geometry = letterboxGeometry(region, IMGSZ);
+    const values = buildInputTensor(input, crop, geometry);
     const tensor = new ort.Tensor('float32', values, [1, 3, IMGSZ, IMGSZ]);
     const preprocessingMs = performance.now() - preprocessingStart;
 
@@ -148,7 +152,15 @@ class Yolov8DartDetector implements DartDetector {
         // These weights annotate each dart as a tiny point box whose centre is
         // the dart's landing point - the author's own pipeline reads that
         // centre from `box.xywhn` (`reference_predict.py`).
-        point: mapLetterboxedToSource({ x: candidate.cx, y: candidate.cy }, geometry),
+        //
+        // The inverse transform is the whole letterbox chain in reverse: undo
+        // the letterbox scale and padding to recover crop-local pixels, then add
+        // the crop origin to return to source-image pixels. With no crop the
+        // second step is the identity.
+        point: cropToSourcePoint(
+          mapLetterboxedToSource({ x: candidate.cx, y: candidate.cy }, geometry),
+          crop,
+        ),
         confidence: candidate.confidence,
         tailHint: null,
       }));
@@ -156,15 +168,23 @@ class Yolov8DartDetector implements DartDetector {
 
     this.lastTrace = {
       ...this.getSettings(),
+      frame: {
+        mode: input.frameMode ?? (crop ? 'board-crop' : 'full'),
+        cropRect: crop ? { ...crop } : null,
+        padRatio: BOARD_CROP_PAD,
+      },
       timings: {
         preprocessingMs,
         inferenceMs,
         postprocessingMs,
       },
       candidates: traceCandidates.map((candidate) => {
-        const point = mapLetterboxedToSource(
-          { x: candidate.cx, y: candidate.cy },
-          geometry,
+        const point = cropToSourcePoint(
+          mapLetterboxedToSource(
+            { x: candidate.cx, y: candidate.cy },
+            geometry,
+          ),
+          crop,
         );
         return {
           anchor: candidate.anchor,
@@ -182,10 +202,10 @@ class Yolov8DartDetector implements DartDetector {
           },
           point,
           boxSource: {
-            left: (candidate.cx - candidate.width / 2 - geometry.left) / geometry.ratio,
-            top: (candidate.cy - candidate.height / 2 - geometry.top) / geometry.ratio,
-            right: (candidate.cx + candidate.width / 2 - geometry.left) / geometry.ratio,
-            bottom: (candidate.cy + candidate.height / 2 - geometry.top) / geometry.ratio,
+            left: (candidate.cx - candidate.width / 2 - geometry.left) / geometry.ratio + (crop?.x ?? 0),
+            top: (candidate.cy - candidate.height / 2 - geometry.top) / geometry.ratio + (crop?.y ?? 0),
+            right: (candidate.cx + candidate.width / 2 - geometry.left) / geometry.ratio + (crop?.x ?? 0),
+            bottom: (candidate.cy + candidate.height / 2 - geometry.top) / geometry.ratio + (crop?.y ?? 0),
           },
         };
       }),
@@ -228,11 +248,20 @@ class Yolov8DartDetector implements DartDetector {
 }
 
 /**
- * Letterbox the source pixels into a square RGB tensor, exactly as the
- * reference implementation does: scale to fit, centre on a grey 114 canvas,
- * convert to 0..1 and lay channels out planar (NCHW).
+ * Letterbox the (optionally cropped) source pixels into a square RGB tensor,
+ * exactly as the reference implementation does: scale to fit, centre on a grey
+ * 114 canvas, convert to 0..1 and lay channels out planar (NCHW).
+ *
+ * When `crop` is given only that sub-rectangle of the photo is scaled into the
+ * canvas, so the board fills far more of the input than it would letterboxed
+ * whole. `geometry` is computed from the crop's own size, which keeps the
+ * aspect ratio unchanged.
  */
-function buildInputTensor(input: DetectInput, geometry: LetterboxGeometry): Float32Array {
+function buildInputTensor(
+  input: DetectInput,
+  crop: CropRect | null,
+  geometry: LetterboxGeometry,
+): Float32Array {
   const source = document.createElement('canvas');
   source.width = input.imageSize.width;
   source.height = input.imageSize.height;
@@ -247,7 +276,18 @@ function buildInputTensor(input: DetectInput, geometry: LetterboxGeometry): Floa
   if (!context) throw new Error('Could not get a 2D canvas context to preprocess the photo.');
   context.fillStyle = `rgb(${LETTERBOX_PAD}, ${LETTERBOX_PAD}, ${LETTERBOX_PAD})`;
   context.fillRect(0, 0, IMGSZ, IMGSZ);
-  context.drawImage(source, geometry.left, geometry.top, geometry.newWidth, geometry.newHeight);
+  const region = crop ?? { x: 0, y: 0, width: input.imageSize.width, height: input.imageSize.height };
+  context.drawImage(
+    source,
+    region.x,
+    region.y,
+    region.width,
+    region.height,
+    geometry.left,
+    geometry.top,
+    geometry.newWidth,
+    geometry.newHeight,
+  );
 
   const { data } = context.getImageData(0, 0, IMGSZ, IMGSZ);
   const plane = IMGSZ * IMGSZ;

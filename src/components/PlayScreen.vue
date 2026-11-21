@@ -5,6 +5,7 @@ import type { RingId } from '../board/boardModel';
 import type { Frame } from '../camera/frame';
 import type { DetectionDiagnostics } from '../detector/debugExport';
 import type { DetectorTrace } from '../detector/Detector';
+import type { FrameMode } from '../detector/crop';
 import type { Calibration } from '../geometry/calibration';
 import type { ViewState } from '../geometry/viewTransform';
 import { sumScores, type DartEntry } from '../scoring/score';
@@ -43,6 +44,8 @@ interface Props {
   diagnostics?: DetectionDiagnostics | null;
   /** Raw class-4 candidates and production filter decisions. */
   trace?: DetectorTrace | null;
+  /** How Detect frames the photo: calibrated board crop (default) or full frame. */
+  frameMode?: FrameMode;
   /** More darts are marked than a visit scores. */
   needsReview?: boolean;
 }
@@ -53,6 +56,7 @@ const props = withDefaults(defineProps<Props>(), {
   detectError: null,
   diagnostics: null,
   trace: null,
+  frameMode: 'board-crop',
   needsReview: false,
 });
 
@@ -69,6 +73,7 @@ const emit = defineEmits<{
   'save-debug-case': [];
   'toggle-manual': [];
   'new-photo': [];
+  'update:frame-mode': [mode: FrameMode];
 }>();
 
 const RING_TEXT: Record<RingId, string> = {
@@ -104,6 +109,17 @@ const selectedId = computed(() => props.activeId ?? null);
 const diagnostics = computed(() => props.diagnostics ?? null);
 const trace = computed(() => props.trace ?? null);
 const candidateCount = computed(() => diagnostics.value?.candidateCount ?? 0);
+
+/** What framing the last Detect press actually used, as recorded by the trace. */
+const frameInfo = computed(() => trace.value?.frame ?? null);
+
+const cropReadout = computed(() => {
+  const info = frameInfo.value;
+  if (!info) return 'n/a';
+  if (!info.cropRect) return 'none (full frame)';
+  const { x, y, width, height } = info.cropRect;
+  return `${width} x ${height} px at ${x}, ${y}`;
+});
 
 /** Three fixed slots so the visit reads the same shape all the way through. */
 const slots = computed(() =>
@@ -249,10 +265,37 @@ function formatConfidence(value: number | null): string {
 
         <section v-if="manualMode || diagnostics" class="debug">
           <h2 class="debug-title">Detection diagnostics</h2>
+
+          <div class="debug-frame" role="group" aria-label="Detector framing">
+            <span class="debug-frame-label">Framing</span>
+            <button
+              class="tiny"
+              :class="{ primary: frameMode === 'board-crop', ghost: frameMode !== 'board-crop' }"
+              :aria-pressed="frameMode === 'board-crop'"
+              @click="emit('update:frame-mode', 'board-crop')"
+            >
+              Board crop
+            </button>
+            <button
+              class="tiny"
+              :class="{ primary: frameMode === 'full', ghost: frameMode !== 'full' }"
+              :aria-pressed="frameMode === 'full'"
+              @click="emit('update:frame-mode', 'full')"
+            >
+              Full frame
+            </button>
+          </div>
+          <p class="debug-frame-note">
+            Board crop feeds the calibrated board region; full frame feeds the whole photo. Re-press
+            Detect after switching to compare the two on the same picture.
+          </p>
+
           <p v-if="!diagnostics" class="muted">No detection has run on this photo yet. Press Detect.</p>
           <template v-else>
             <dl class="debug-grid">
               <div><dt>Source</dt><dd>{{ diagnostics.imageWidth }} x {{ diagnostics.imageHeight }} px</dd></div>
+              <div><dt>Framing</dt><dd>{{ frameInfo ? frameInfo.mode : frameMode }}</dd></div>
+              <div v-if="frameInfo"><dt>Crop rect</dt><dd>{{ cropReadout }}</dd></div>
               <div><dt>Model load</dt><dd>{{ diagnostics.modelLoadMs }} ms</dd></div>
               <div><dt>Preprocess</dt><dd>{{ diagnostics.preprocessingMs }} ms</dd></div>
               <div><dt>Inference</dt><dd>{{ diagnostics.inferenceMs }} ms</dd></div>
@@ -574,6 +617,25 @@ function formatConfidence(value: number | null): string {
   font-size: 0.78rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.debug-frame {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.debug-frame-label {
+  flex: 1 1 auto;
+  font-size: 0.76rem;
+  color: var(--muted);
+}
+
+.debug-frame-note {
+  margin: 0 0 10px;
+  font-size: 0.72rem;
   color: var(--muted);
 }
 

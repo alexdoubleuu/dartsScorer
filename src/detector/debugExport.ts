@@ -109,6 +109,12 @@ export interface DebugCase {
     modelFile: string;
     settings: DetectorSettings | null;
     trace: DetectorTrace | null;
+    /**
+     * Which framing the exported press used, and the crop rectangle in source
+     * pixels. Mirrors `trace.frame` so the crop is visible without digging into
+     * the candidate list; null when the press never ran the detector.
+     */
+    frame: DetectorTrace['frame'] | null;
   };
   debugOverlay: {
     dataUrl: string;
@@ -198,6 +204,7 @@ export async function buildDebugCase(input: DebugCaseInput): Promise<DebugCase> 
       modelFile: 'models/dart-detector.onnx',
       settings: input.settings,
       trace: input.trace,
+      frame: input.trace?.frame ?? null,
     },
     debugOverlay: {
       dataUrl: await blobDataUrl(overlay),

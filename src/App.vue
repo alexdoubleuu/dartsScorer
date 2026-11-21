@@ -19,6 +19,7 @@ import {
   type DetectorTrace,
 } from './detector/Detector';
 import { imageDataFromUrl } from './detector/imageInput';
+import { boardCropRect, type FrameMode } from './detector/crop';
 import type { Calibration } from './geometry/calibration';
 import { defaultView, type ViewState } from './geometry/viewTransform';
 import { scoreImagePoint, type DartEntry, type DartScore, type MarkedDart } from './scoring/score';
@@ -64,6 +65,12 @@ const calibration = ref<Calibration | null>(null);
 const darts = ref<MarkedDart[]>([]);
 const selectedDartId = ref<string | null>(null);
 const manualMode = ref(false);
+/**
+ * How the detector frames the photo. 'board-crop' crops to the calibrated board
+ * first (the shipped default); 'full' feeds the whole frame and exists as a
+ * reversible debug baseline for comparing the two on the same photo.
+ */
+const frameMode = ref<FrameMode>('board-crop');
 const view = ref<ViewState>({ zoom: 1, focus: { x: 0, y: 0 } });
 const reuseCandidate = ref<StoredCalibration | null>(null);
 const reuseNote = ref<string | null>(null);
@@ -141,7 +148,16 @@ async function detectDarts(): Promise<void> {
     await active.load({ imageSize });
     modelLoadMs = performance.now() - loadStart;
 
-    found = await active.detect({ imageData, imageSize });
+    // The board crop comes straight from the calibration already solved for
+    // this photo; if there is none, or the board cannot be projected, the
+    // whole frame is used and the trace records that no crop was applied.
+    const currentCalibration = calibration.value;
+    const crop =
+      frameMode.value === 'board-crop' && currentCalibration
+        ? boardCropRect(currentCalibration, imageSize)
+        : null;
+
+    found = await active.detect({ imageData, imageSize, crop, frameMode: frameMode.value });
     trace = active.getLastTrace?.() ?? null;
     inferenceMs = trace?.timings.inferenceMs ?? 0;
     preprocessingMs = trace?.timings.preprocessingMs ?? 0;
@@ -480,6 +496,7 @@ function clearCorrection(): void {
       :view="view"
       :manual-mode="manualMode"
       :max-darts="MAX_DARTS"
+      :frame-mode="frameMode"
       :active-id="selectedDartId"
       :status-label="statusLabel"
       :status-detail="statusDetail"
@@ -498,6 +515,7 @@ function clearCorrection(): void {
       @undo="undoDart"
       @reset="resetDarts"
       @toggle-manual="manualMode = !manualMode"
+      @update:frame-mode="frameMode = $event"
       @new-photo="changeImage"
       @update:view="view = $event"
     />
