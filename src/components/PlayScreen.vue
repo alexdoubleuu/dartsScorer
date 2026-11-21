@@ -4,6 +4,7 @@ import ImageViewer from './ImageViewer.vue';
 import type { RingId } from '../board/boardModel';
 import type { Frame } from '../camera/frame';
 import type { DetectionDiagnostics } from '../detector/debugExport';
+import type { DetectorTrace } from '../detector/Detector';
 import type { Calibration } from '../geometry/calibration';
 import type { ViewState } from '../geometry/viewTransform';
 import { sumScores, type DartEntry } from '../scoring/score';
@@ -40,6 +41,8 @@ interface Props {
   detectError?: string | null;
   /** Record of the last Detect press, shown in debug mode. */
   diagnostics?: DetectionDiagnostics | null;
+  /** Raw class-4 candidates and production filter decisions. */
+  trace?: DetectorTrace | null;
   /** More darts are marked than a visit scores. */
   needsReview?: boolean;
 }
@@ -49,6 +52,7 @@ const props = withDefaults(defineProps<Props>(), {
   detecting: false,
   detectError: null,
   diagnostics: null,
+  trace: null,
   needsReview: false,
 });
 
@@ -62,10 +66,9 @@ const emit = defineEmits<{
   undo: [];
   reset: [];
   detect: [];
+  'save-debug-case': [];
   'toggle-manual': [];
   'new-photo': [];
-  'export-overlay': [];
-  'export-json': [];
 }>();
 
 const RING_TEXT: Record<RingId, string> = {
@@ -89,11 +92,18 @@ watch(
     if (manual) sheetOpen.value = true;
   },
 );
+watch(
+  () => props.diagnostics,
+  (diagnostics) => {
+    if (diagnostics) sheetOpen.value = true;
+  },
+);
 
 const total = computed(() => sumScores(props.entries.flatMap((entry) => (entry.score ? [entry.score] : []))));
 const selectedId = computed(() => props.activeId ?? null);
 const diagnostics = computed(() => props.diagnostics ?? null);
-const candidateCount = computed(() => diagnostics.value?.candidates.length ?? 0);
+const trace = computed(() => props.trace ?? null);
+const candidateCount = computed(() => diagnostics.value?.candidateCount ?? 0);
 
 /** Three fixed slots so the visit reads the same shape all the way through. */
 const slots = computed(() =>
@@ -237,20 +247,40 @@ function formatConfidence(value: number | null): string {
           <button class="danger" :disabled="entries.length === 0" @click="emit('reset')">Reset visit</button>
         </div>
 
-        <section v-if="manualMode" class="debug">
+        <section v-if="manualMode || diagnostics" class="debug">
           <h2 class="debug-title">Detection diagnostics</h2>
           <p v-if="!diagnostics" class="muted">No detection has run on this photo yet. Press Detect.</p>
           <template v-else>
             <dl class="debug-grid">
               <div><dt>Source</dt><dd>{{ diagnostics.imageWidth }} x {{ diagnostics.imageHeight }} px</dd></div>
               <div><dt>Model load</dt><dd>{{ diagnostics.modelLoadMs }} ms</dd></div>
+              <div><dt>Preprocess</dt><dd>{{ diagnostics.preprocessingMs }} ms</dd></div>
               <div><dt>Inference</dt><dd>{{ diagnostics.inferenceMs }} ms</dd></div>
-              <div><dt>Whole Detect</dt><dd>{{ diagnostics.totalMs }} ms</dd></div>
-              <div><dt>Candidates</dt><dd>{{ candidateCount }}</dd></div>
+              <div><dt>Decode</dt><dd>{{ diagnostics.postprocessingMs }} ms</dd></div>
+              <div><dt>Detect-to-render</dt><dd>{{ diagnostics.totalMs }} ms</dd></div>
+              <div><dt>Class-4 candidates</dt><dd>{{ candidateCount }}</dd></div>
+              <div><dt>Retained</dt><dd>{{ diagnostics.retainedCount }}</dd></div>
               <div><dt>Marked</dt><dd>{{ entries.length }}</dd></div>
             </dl>
 
-            <ul class="debug-list">
+            <ul v-if="trace" class="debug-list">
+              <li v-for="(candidate, index) in trace.candidates" :key="candidate.anchor">
+                <span class="debug-index">#{{ index + 1 }}</span>
+                <span class="debug-conf">{{ formatConfidence(candidate.confidence) }}</span>
+                <span class="debug-status" :class="`debug-status--${candidate.disposition}`">
+                  {{ candidate.disposition }}
+                  <template v-if="candidate.suppressedByAnchor !== undefined">
+                    by {{ candidate.suppressedByAnchor }}
+                  </template>
+                </span>
+                <span class="debug-xy">
+                  centre {{ candidate.point.x.toFixed(1) }}, {{ candidate.point.y.toFixed(1) }} px;
+                  box {{ candidate.boxSource.left.toFixed(1) }}, {{ candidate.boxSource.top.toFixed(1) }}
+                  - {{ candidate.boxSource.right.toFixed(1) }}, {{ candidate.boxSource.bottom.toFixed(1) }} px
+                </span>
+              </li>
+            </ul>
+            <ul v-else-if="diagnostics.candidates.length" class="debug-list">
               <li v-for="(candidate, index) in diagnostics.candidates" :key="index">
                 <span class="debug-index">#{{ index + 1 }}</span>
                 <span class="debug-conf">{{ formatConfidence(candidate.confidence) }}</span>
@@ -265,8 +295,13 @@ function formatConfidence(value: number | null): string {
             </p>
 
             <div class="sheet-actions">
-              <button class="ghost" @click="emit('export-overlay')">Save overlay PNG</button>
-              <button class="ghost" @click="emit('export-json')">Save predictions</button>
+              <button
+                class="ghost"
+                :disabled="!diagnostics"
+                @click="emit('save-debug-case')"
+              >
+                Save debug case
+              </button>
             </div>
           </template>
         </section>
@@ -576,6 +611,7 @@ function formatConfidence(value: number | null): string {
 .debug-list li {
   display: flex;
   align-items: baseline;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 3px 0;
   font-size: 0.78rem;
@@ -594,6 +630,28 @@ function formatConfidence(value: number | null): string {
   font-weight: 700;
   color: var(--dart);
   font-variant-numeric: tabular-nums;
+}
+
+.debug-status {
+  min-width: 120px;
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.debug-status--retained {
+  color: #3fb950;
+}
+
+.debug-status--nms-suppressed {
+  color: #f85149;
+}
+
+.debug-status--below-confidence {
+  color: #d29922;
+}
+
+.debug-status--other-class-wins {
+  color: #a371f7;
 }
 
 .debug-xy {

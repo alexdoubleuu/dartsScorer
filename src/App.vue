@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, ref } from 'vue';
 import CameraPanel from './components/CameraPanel.vue';
 import CalibrationWorkspace from './components/CalibrationWorkspace.vue';
 import PlayScreen from './components/PlayScreen.vue';
@@ -7,12 +7,17 @@ import ScoreCorrection from './components/ScoreCorrection.vue';
 import { assessReuse, loadCalibration, saveCalibration, type StoredCalibration } from './calibration/store';
 import { releaseFrame, type Frame } from './camera/frame';
 import {
-  buildOverlayPng,
-  diagnosticsToJson,
+  buildDebugCase,
+  debugCaseToJson,
   downloadBlob,
   type DetectionDiagnostics,
 } from './detector/debugExport';
-import { DEFAULT_DETECTOR_ID, getDetector, type DartDetection } from './detector/Detector';
+import {
+  DEFAULT_DETECTOR_ID,
+  getDetector,
+  type DartDetection,
+  type DetectorTrace,
+} from './detector/Detector';
 import { imageDataFromUrl } from './detector/imageInput';
 import type { Calibration } from './geometry/calibration';
 import { defaultView, type ViewState } from './geometry/viewTransform';
@@ -65,6 +70,7 @@ const reuseNote = ref<string | null>(null);
 const correctingId = ref<string | null>(null);
 
 let dartSequence = 0;
+const detectedMarkerIds = new Set<string>();
 
 onBeforeUnmount(() => releaseFrame(frame.value));
 
@@ -76,6 +82,7 @@ const detectError = ref<string | null>(null);
 const detectNote = ref<string | null>(null);
 /** Full record of the last Detect press, shown in the debug panel and exportable. */
 const detectDiagnostics = ref<DetectionDiagnostics | null>(null);
+const detectTrace = ref<DetectorTrace | null>(null);
 
 /** More darts marked than a visit scores: the result needs a human review. */
 const needsReview = computed(() => darts.value.length > MAX_DARTS);
@@ -114,12 +121,17 @@ async function detectDarts(): Promise<void> {
   detectBusy.value = true;
   detectError.value = null;
   detectNote.value = null;
+  active.clearLastTrace?.();
 
   const imageSize = { width: currentFrame.width, height: currentFrame.height };
   const startedAt = performance.now();
   let modelLoadMs = 0;
   let inferenceMs = 0;
+  let preprocessingMs = 0;
+  let postprocessingMs = 0;
   let found: DartDetection[] = [];
+  let trace: DetectorTrace | null = null;
+  const candidateMarkerIds: string[] = [];
   const errors: string[] = [];
 
   try {
@@ -129,15 +141,20 @@ async function detectDarts(): Promise<void> {
     await active.load({ imageSize });
     modelLoadMs = performance.now() - loadStart;
 
-    const inferenceStart = performance.now();
     found = await active.detect({ imageData, imageSize });
-    inferenceMs = performance.now() - inferenceStart;
+    trace = active.getLastTrace?.() ?? null;
+    inferenceMs = trace?.timings.inferenceMs ?? 0;
+    preprocessingMs = trace?.timings.preprocessingMs ?? 0;
+    postprocessingMs = trace?.timings.postprocessingMs ?? 0;
 
     darts.value = [
       ...darts.value,
       ...found.map((detection) => {
         dartSequence += 1;
-        return { id: `dart-${dartSequence}`, point: detection.point };
+        const id = `dart-${dartSequence}`;
+        candidateMarkerIds.push(id);
+        detectedMarkerIds.add(id);
+        return { id, point: detection.point };
       }),
     ];
 
@@ -159,16 +176,20 @@ async function detectDarts(): Promise<void> {
     detectError.value = message;
     errors.push(message);
   } finally {
+    detectTrace.value = trace;
     detectDiagnostics.value = {
       detectorName: active.name,
       imageWidth: imageSize.width,
       imageHeight: imageSize.height,
       modelLoadMs: Math.round(modelLoadMs),
       inferenceMs: Math.round(inferenceMs),
-      totalMs: Math.round(performance.now() - startedAt),
-      candidateCount: found.length,
+      preprocessingMs: Math.round(preprocessingMs),
+      postprocessingMs: Math.round(postprocessingMs),
+      totalMs: 0,
+      candidateCount: trace?.candidates.length ?? found.length,
       retainedCount: found.length,
-      candidates: found.map((detection) => ({
+      candidates: found.map((detection, index) => ({
+        markerId: candidateMarkerIds[index] ?? null,
         point: { ...detection.point },
         norm: {
           x: detection.point.x / imageSize.width,
@@ -179,6 +200,14 @@ async function detectDarts(): Promise<void> {
       errors,
     };
     detectBusy.value = false;
+    await nextTick();
+    if (detectDiagnostics.value) {
+      detectDiagnostics.value = {
+        ...detectDiagnostics.value,
+        totalMs: Math.round(performance.now() - startedAt),
+      };
+      await nextTick();
+    }
   }
 }
 
@@ -188,39 +217,68 @@ function fileStamp(): string {
   return new Date().toISOString().replace(/[:.]/g, '-');
 }
 
-/** Save the photo with the projected board and every candidate drawn on it. */
-async function exportDebugOverlay(): Promise<void> {
+/** Save one self-contained file with the frame, calibration and detector trace. */
+async function exportDebugCase(): Promise<void> {
   const currentFrame = frame.value;
+  const currentCalibration = calibration.value;
   const diagnostics = detectDiagnostics.value;
-  if (!currentFrame || !diagnostics) return;
+  const active = detector;
+  if (!currentFrame) {
+    detectError.value = 'Upload or capture a photo in the app before saving a debug case.';
+    return;
+  }
+  if (!currentCalibration || !diagnostics || !active) {
+    detectError.value = 'Calibrate this photo and press Detect before saving a debug case.';
+    return;
+  }
+
+  detectError.value = null;
   try {
-    const blob = await buildOverlayPng(currentFrame, calibration.value, diagnostics);
-    downloadBlob(blob, `dart-detect-overlay-${fileStamp()}.png`);
+    const debugCase = await buildDebugCase({
+      frame: currentFrame,
+      calibration: currentCalibration,
+      diagnostics,
+      detectorId: active.id,
+      detectorName: active.name,
+      settings: active.getSettings?.() ?? null,
+      trace: detectTrace.value,
+      markers: entries.value.map((entry) => ({
+        id: entry.id,
+        origin: detectedMarkerIds.has(entry.id) ? 'detector' : 'manual',
+        point: { ...entry.point },
+        score: entry.score
+          ? {
+              label: entry.score.label,
+              points: entry.score.score,
+              segment: entry.score.segment,
+              multiplier: entry.score.multiplier,
+              ring: entry.score.ring,
+            }
+          : null,
+        corrected: entry.corrected,
+      })),
+    });
+    downloadBlob(
+      new Blob([debugCaseToJson(debugCase)], { type: 'application/json' }),
+      `dart-debug-case-${fileStamp()}.json`,
+    );
   } catch (error) {
     detectError.value = error instanceof Error ? error.message : String(error);
   }
-}
-
-/** Save every candidate coordinate and timing as JSON. */
-function exportPredictions(): void {
-  const diagnostics = detectDiagnostics.value;
-  if (!diagnostics) return;
-  downloadBlob(
-    new Blob([diagnosticsToJson(diagnostics)], { type: 'application/json' }),
-    `dart-predictions-${fileStamp()}.json`,
-  );
 }
 
 /* ------------------------------------------------------------- image input -- */
 
 function resetForNewImage(): void {
   darts.value = [];
+  detectedMarkerIds.clear();
   selectedDartId.value = null;
   calibration.value = null;
   correctingId.value = null;
   detectError.value = null;
   detectNote.value = null;
   detectDiagnostics.value = null;
+  detectTrace.value = null;
 }
 
 function onFrame(next: Frame): void {
@@ -428,10 +486,10 @@ function clearCorrection(): void {
       :detecting="detectBusy"
       :detect-error="detectError"
       :diagnostics="detectDiagnostics"
+      :trace="detectTrace"
       :needs-review="needsReview"
       @detect="detectDarts"
-      @export-overlay="exportDebugOverlay"
-      @export-json="exportPredictions"
+      @save-debug-case="exportDebugCase"
       @place="onPlace"
       @move="onMarkerMove"
       @select="onMarkerSelect"

@@ -54,6 +54,42 @@ export interface DartDetection {
   tailHint: Point | null;
 }
 
+export interface DetectorTraceCandidate {
+  anchor: number;
+  confidence: number;
+  winningClassId: number;
+  disposition: 'below-confidence' | 'other-class-wins' | 'nms-suppressed' | 'retained';
+  suppressedByAnchor?: number;
+  /** Model-input coordinates, before inverse letterboxing. */
+  boxLetterboxed: { left: number; top: number; right: number; bottom: number };
+  /** Box centre and extent mapped back to the source image. */
+  point: Point;
+  boxSource: { left: number; top: number; right: number; bottom: number };
+}
+
+export interface DetectorTrace {
+  debugThreshold: number;
+  productionConfidenceThreshold: number;
+  iouThreshold: number;
+  inputSize: number;
+  classId: number;
+  className: string;
+  preprocessing: {
+    colorSpace: 'RGB';
+    scale: '0..1';
+    letterboxPad: number;
+    layout: 'NCHW';
+  };
+  timings: {
+    preprocessingMs: number;
+    inferenceMs: number;
+    postprocessingMs: number;
+  };
+  candidates: DetectorTraceCandidate[];
+}
+
+export type DetectorSettings = Omit<DetectorTrace, 'candidates' | 'timings'>;
+
 export interface DetectInput {
   /** The frozen frame to analyse, in the same coordinate system as calibration. */
   imageData: ImageData;
@@ -78,6 +114,12 @@ export interface DartDetector {
   load(context: DetectorContext): Promise<void>;
   /** Return zero or more dart entry points. Never returns placeholder data. */
   detect(input: DetectInput): Promise<DartDetection[]>;
+  /** Optional trace captured from the most recent inference for debug export. */
+  getLastTrace?(): DetectorTrace | null;
+  /** Optional immutable runtime settings, available even if inference fails. */
+  getSettings?(): DetectorSettings;
+  /** Clear any previous-photo trace before starting another Detect press. */
+  clearLastTrace?(): void;
   dispose(): Promise<void>;
 }
 

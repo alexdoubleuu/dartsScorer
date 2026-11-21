@@ -1,10 +1,18 @@
 import type { InferenceSession } from 'onnxruntime-web';
-import type { DartDetection, DartDetector, DetectInput, DetectorContext } from './Detector';
+import type {
+  DartDetection,
+  DartDetector,
+  DetectorContext,
+  DetectorSettings,
+  DetectorTrace,
+  DetectInput,
+} from './Detector';
 import {
   LETTERBOX_PAD,
   decodeYolov8,
   letterboxGeometry,
   mapLetterboxedToSource,
+  traceDartCandidates,
   type LetterboxGeometry,
 } from './yolov8';
 
@@ -44,6 +52,7 @@ const DART_CLASS = 4;
  */
 const DART_CONFIDENCE = 0.25;
 const IOU_THRESHOLD = 0.7;
+const DEBUG_CONFIDENCE = 0.01;
 
 class Yolov8DartDetector implements DartDetector {
   readonly id = 'yolov8-dart-sense-onnx-800';
@@ -53,6 +62,7 @@ class Yolov8DartDetector implements DartDetector {
   private ort: Ort | null = null;
   private session: InferenceSession | null = null;
   private loading: Promise<void> | null = null;
+  private lastTrace: DetectorTrace | null = null;
 
   async load(_context: DetectorContext): Promise<void> {
     if (this.session) return;
@@ -98,45 +108,122 @@ class Yolov8DartDetector implements DartDetector {
     const ort = this.ort;
     const session = this.session;
     if (!ort || !session) throw new Error('Detector used before load() finished.');
+    this.clearLastTrace();
 
+    const preprocessingStart = performance.now();
     const geometry = letterboxGeometry(input.imageSize, IMGSZ);
     const values = buildInputTensor(input, geometry);
     const tensor = new ort.Tensor('float32', values, [1, 3, IMGSZ, IMGSZ]);
+    const preprocessingMs = performance.now() - preprocessingStart;
 
     const inputName = session.inputNames[0];
+    const inferenceStart = performance.now();
     const results = await session.run({ [inputName]: tensor });
+    const inferenceMs = performance.now() - inferenceStart;
     const output = results[session.outputNames[0]];
 
+    const postprocessingStart = performance.now();
     const dims = output.dims as [number, number, number];
     const channels = dims[1];
     const anchors = dims[2];
 
-    const raw = decodeYolov8(output.data as Float32Array, {
+    const decodeOptions = {
       channels,
       anchors,
       classCount: channels - 4,
       confidenceThreshold: DART_CONFIDENCE,
       iouThreshold: IOU_THRESHOLD,
-    });
-
-    return raw
+    };
+    const outputData = output.data as Float32Array;
+    const raw = decodeYolov8(outputData, decodeOptions);
+    const traceCandidates = traceDartCandidates(
+      outputData,
+      decodeOptions,
+      DART_CLASS,
+      DEBUG_CONFIDENCE,
+    );
+    const detections = raw
       .filter((candidate) => candidate.classId === DART_CLASS)
       .map((candidate) => ({
         // These weights annotate each dart as a tiny point box whose centre is
-        // the dart's landing point - the author's own pipeline reads a dart's
-        // position as `box.xywhn` centre (`reference_predict.py`). The decoded
-        // box centre is therefore the entry point, not a box-centroid
-        // approximation of a dart-shaped object.
+        // the dart's landing point - the author's own pipeline reads that
+        // centre from `box.xywhn` (`reference_predict.py`).
         point: mapLetterboxedToSource({ x: candidate.cx, y: candidate.cy }, geometry),
         confidence: candidate.confidence,
         tailHint: null,
       }));
+    const postprocessingMs = performance.now() - postprocessingStart;
+
+    this.lastTrace = {
+      ...this.getSettings(),
+      timings: {
+        preprocessingMs,
+        inferenceMs,
+        postprocessingMs,
+      },
+      candidates: traceCandidates.map((candidate) => {
+        const point = mapLetterboxedToSource(
+          { x: candidate.cx, y: candidate.cy },
+          geometry,
+        );
+        return {
+          anchor: candidate.anchor,
+          confidence: candidate.confidence,
+          winningClassId: candidate.winningClassId,
+          disposition: candidate.disposition,
+          ...(candidate.suppressedByAnchor === undefined
+            ? {}
+            : { suppressedByAnchor: candidate.suppressedByAnchor }),
+          boxLetterboxed: {
+            left: candidate.cx - candidate.width / 2,
+            top: candidate.cy - candidate.height / 2,
+            right: candidate.cx + candidate.width / 2,
+            bottom: candidate.cy + candidate.height / 2,
+          },
+          point,
+          boxSource: {
+            left: (candidate.cx - candidate.width / 2 - geometry.left) / geometry.ratio,
+            top: (candidate.cy - candidate.height / 2 - geometry.top) / geometry.ratio,
+            right: (candidate.cx + candidate.width / 2 - geometry.left) / geometry.ratio,
+            bottom: (candidate.cy + candidate.height / 2 - geometry.top) / geometry.ratio,
+          },
+        };
+      }),
+    };
+
+    return detections;
+  }
+
+  getLastTrace(): DetectorTrace | null {
+    return this.lastTrace;
+  }
+
+  getSettings(): DetectorSettings {
+    return {
+      debugThreshold: DEBUG_CONFIDENCE,
+      productionConfidenceThreshold: DART_CONFIDENCE,
+      iouThreshold: IOU_THRESHOLD,
+      inputSize: IMGSZ,
+      classId: DART_CLASS,
+      className: 'dart',
+      preprocessing: {
+        colorSpace: 'RGB',
+        scale: '0..1',
+        letterboxPad: LETTERBOX_PAD,
+        layout: 'NCHW',
+      },
+    };
+  }
+
+  clearLastTrace(): void {
+    this.lastTrace = null;
   }
 
   async dispose(): Promise<void> {
     await this.session?.release();
     this.session = null;
     this.ort = null;
+    this.lastTrace = null;
   }
 }
 

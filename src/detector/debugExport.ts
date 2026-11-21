@@ -1,6 +1,7 @@
 import type { Frame } from '../camera/frame';
-import type { Calibration } from '../geometry/calibration';
+import { CALIBRATION_REFS, type Calibration } from '../geometry/calibration';
 import { boardNumberLabels, boardRingShapes, boardWireShapes } from '../overlay/boardOverlay';
+import type { DetectorSettings, DetectorTrace } from './Detector';
 import type { Point } from '../types';
 
 /**
@@ -12,19 +13,17 @@ import type { Point } from '../types';
  * inference itself took, how many darts the model proposed, and a file the
  * tester can download afterwards.
  *
- * Two artefacts are produced:
- *   - a PNG overlay of the photo with the projected board, the detection
- *     candidates, their index and their confidence, and
- *   - a JSON record of every candidate in both image pixels and normalised
- *     coordinates, so predictions can be compared against entry points that
- *     were checked independently by eye rather than only against the model.
+ * One self-contained JSON case is produced. It embeds the analysed photo, the
+ * calibration and detector settings, all candidate/filter decisions, the
+ * current scored markers, and a PNG overlay as a data URL.
  *
- * The overlay is drawn at the source resolution and uses the app's own board
- * overlay geometry, so it lines up with what the screen showed.
+ * The overlay uses the app's own board geometry. Candidate boxes and centres
+ * are drawn on the photo, with a side legend so overlapping labels stay legible.
  */
 
 /** One detection the model proposed, whether or not it was kept. */
 export interface DetectionCandidate {
+  markerId: string | null;
   /** Entry point in source-image pixels, the same grid as calibration. */
   point: Point;
   /** The same point as a 0..1 fraction of the image, for offline cross-checks. */
@@ -39,17 +38,181 @@ export interface DetectionDiagnostics {
   imageHeight: number;
   /** Fetch + initialise the model and wasm backend. 0 when already loaded. */
   modelLoadMs: number;
-  /** `session.run` plus output decoding only - the cost of one inference. */
+  /** Time in the ONNX Runtime session.run call itself. */
   inferenceMs: number;
-  /** The whole press: preprocess, load, inference, decode. */
+  preprocessingMs: number;
+  postprocessingMs: number;
+  /** Time from Detect press through the first rendered result update. */
   totalMs: number;
-  /** Darts the model proposed on this photo. */
+  /** Class-4 candidates at or above the low debug threshold. */
   candidateCount: number;
-  /** Darts kept as scored markers when the press finished. */
+  /** Candidates retained by production confidence filtering and NMS. */
   retainedCount: number;
+  /** Production-retained points. */
   candidates: DetectionCandidate[];
   /** Runtime errors surfaced during the press, in order. */
   errors: string[];
+}
+
+export interface DebugCaseMarker {
+  id: string;
+  origin: 'detector' | 'manual';
+  point: Point;
+  score: {
+    label: string;
+    points: number;
+    segment: number | 'BULL' | 'MISS';
+    multiplier: number;
+    ring: string;
+  } | null;
+  corrected: boolean;
+}
+
+export interface DebugCaseInput {
+  frame: Frame;
+  calibration: Calibration;
+  diagnostics: DetectionDiagnostics;
+  detectorId: string;
+  detectorName: string;
+  settings: DetectorSettings | null;
+  trace: DetectorTrace | null;
+  markers: DebugCaseMarker[];
+}
+
+/** Self-contained case file intended to be shared for offline diagnosis. */
+export interface DebugCase {
+  schema: 'darts-scorer-debug-case/v1';
+  createdAt: string;
+  sourceImage: {
+    dataUrl: string;
+    mimeType: string;
+    origin: Frame['origin'];
+    width: number;
+    height: number;
+  };
+  imageSize: { width: number; height: number };
+  calibration: {
+    imageSize: Calibration['imageSize'];
+    residual: number;
+    refPoints: Array<{
+      order: number;
+      id: string;
+      label: string;
+      point: Point;
+    }>;
+    imageToBoard: Calibration['imageToBoard'];
+    boardToImage: Calibration['boardToImage'];
+  };
+  detector: {
+    id: string;
+    name: string;
+    modelFile: string;
+    settings: DetectorSettings | null;
+    trace: DetectorTrace | null;
+  };
+  debugOverlay: {
+    dataUrl: string;
+    mimeType: 'image/png';
+  } | null;
+  diagnostics: DetectionDiagnostics;
+  predictions: {
+    retained: DetectionDiagnostics['candidates'];
+    scoredMarkers: DebugCaseMarker[];
+  };
+}
+
+async function frameDataUrl(frame: Frame): Promise<{ dataUrl: string; mimeType: string }> {
+  let blob: Blob;
+  try {
+    const response = await fetch(frame.url);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    blob = await response.blob();
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    throw new Error(
+      `The analysed photo is no longer available (${detail}). Upload or capture it again in the app, recalibrate, and press Detect before saving the debug case.`,
+    );
+  }
+  if (!blob.size) {
+    throw new Error(
+      'The analysed photo is empty. Upload or capture it again in the app, recalibrate, and press Detect before saving the debug case.',
+    );
+  }
+
+  const dataUrl = await blobDataUrl(blob);
+  return { dataUrl, mimeType: blob.type || 'application/octet-stream' };
+}
+
+function blobDataUrl(blob: Blob): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not package debug image data.'));
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') {
+        reject(new Error('Could not package debug image data.'));
+        return;
+      }
+      resolve(reader.result);
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
+/**
+ * Bundle the exact analysed frame and all app-side context in one JSON file.
+ * The blob URL is fetched immediately so the photo survives after navigation.
+ */
+export async function buildDebugCase(input: DebugCaseInput): Promise<DebugCase> {
+  const image = await frameDataUrl(input.frame);
+  const overlay = await buildOverlayPng(
+    input.frame,
+    input.calibration,
+    input.diagnostics,
+    input.trace,
+  );
+  return {
+    schema: 'darts-scorer-debug-case/v1',
+    createdAt: new Date().toISOString(),
+    sourceImage: {
+      ...image,
+      origin: input.frame.origin,
+      width: input.frame.width,
+      height: input.frame.height,
+    },
+    imageSize: { width: input.frame.width, height: input.frame.height },
+    calibration: {
+      imageSize: { ...input.calibration.imageSize },
+      residual: input.calibration.residual,
+      refPoints: input.calibration.refPoints.map((point, index) => ({
+        order: index + 1,
+        id: CALIBRATION_REFS[index]?.id ?? `unknown-${index + 1}`,
+        label: CALIBRATION_REFS[index]?.label ?? `Reference ${index + 1}`,
+        point: { ...point },
+      })),
+      imageToBoard: input.calibration.imageToBoard,
+      boardToImage: input.calibration.boardToImage,
+    },
+    detector: {
+      id: input.detectorId,
+      name: input.detectorName,
+      modelFile: 'models/dart-detector.onnx',
+      settings: input.settings,
+      trace: input.trace,
+    },
+    debugOverlay: {
+      dataUrl: await blobDataUrl(overlay),
+      mimeType: 'image/png',
+    },
+    diagnostics: input.diagnostics,
+    predictions: {
+      retained: input.diagnostics.candidates,
+      scoredMarkers: input.markers,
+    },
+  };
+}
+
+export function debugCaseToJson(debugCase: DebugCase): string {
+  return JSON.stringify(debugCase, null, 2);
 }
 
 function loadFrameImage(frame: Frame): Promise<HTMLImageElement> {
@@ -72,16 +235,27 @@ export async function buildOverlayPng(
   frame: Frame,
   calibration: Calibration | null,
   diagnostics: DetectionDiagnostics,
+  trace: DetectorTrace | null = null,
 ): Promise<Blob> {
   const image = await loadFrameImage(frame);
+  const unit = Math.max(1, frame.width / 800);
+  const panelWidth = trace ? 360 * unit : 0;
+  const rowHeight = 20 * unit;
+  const panelTop = 58 * unit;
+  const orderedTrace = trace
+    ? [...trace.candidates].sort((a, b) => b.confidence - a.confidence)
+    : [];
   const canvas = document.createElement('canvas');
-  canvas.width = frame.width;
-  canvas.height = frame.height;
+  canvas.width = frame.width + panelWidth;
+  canvas.height = Math.max(
+    frame.height,
+    trace ? panelTop + orderedTrace.length * rowHeight + 12 * unit : frame.height,
+  );
   const context = canvas.getContext('2d');
   if (!context) throw new Error('Could not create a canvas for the debug overlay.');
+  context.fillStyle = '#0d1117';
+  context.fillRect(0, 0, canvas.width, canvas.height);
   context.drawImage(image, 0, 0, frame.width, frame.height);
-
-  const unit = Math.max(1, frame.width / 800);
 
   if (calibration) {
     context.save();
@@ -108,30 +282,93 @@ export async function buildOverlayPng(
 
   const radius = 6 * unit;
   context.save();
-  context.lineWidth = 2 * unit;
-  context.strokeStyle = 'rgba(248, 81, 73, 0.95)';
   context.font = `bold ${14 * unit}px sans-serif`;
   context.textAlign = 'left';
   context.textBaseline = 'middle';
-  diagnostics.candidates.forEach((candidate, index) => {
-    const { x, y } = candidate.point;
-    context.beginPath();
-    context.arc(x, y, radius, 0, Math.PI * 2);
-    context.moveTo(x - radius * 1.7, y);
-    context.lineTo(x + radius * 1.7, y);
-    context.moveTo(x, y - radius * 1.7);
-    context.lineTo(x, y + radius * 1.7);
-    context.stroke();
+  const colorFor = (disposition: DetectorTrace['candidates'][number]['disposition']) => {
+    switch (disposition) {
+      case 'retained':
+        return '#3fb950';
+      case 'nms-suppressed':
+        return '#f85149';
+      case 'below-confidence':
+        return '#d29922';
+      case 'other-class-wins':
+        return '#a371f7';
+    }
+  };
+  if (trace) {
+    orderedTrace.forEach((candidate, index) => {
+      const color = colorFor(candidate.disposition);
+      const { left, top, right, bottom } = candidate.boxSource;
+      const { x, y } = candidate.point;
+      context.lineWidth = 2 * unit;
+      context.strokeStyle = color;
+      context.strokeRect(left, top, right - left, bottom - top);
+      context.beginPath();
+      context.arc(x, y, radius, 0, Math.PI * 2);
+      context.moveTo(x - radius * 1.7, y);
+      context.lineTo(x + radius * 1.7, y);
+      context.moveTo(x, y - radius * 1.7);
+      context.lineTo(x, y + radius * 1.7);
+      context.stroke();
 
-    const text = `#${index + 1} ${candidate.confidence === null ? 'n/a' : candidate.confidence.toFixed(2)}`;
-    const textX = x + radius * 1.9;
-    const textY = y - radius * 1.9;
-    const width = context.measureText(text).width;
-    context.fillStyle = 'rgba(0, 0, 0, 0.65)';
-    context.fillRect(textX, textY - 10 * unit, width + 8 * unit, 20 * unit);
-    context.fillStyle = '#ffdd57';
-    context.fillText(text, textX + 4 * unit, textY);
-  });
+      const tag = `#${index + 1}`;
+      const tagWidth = context.measureText(tag).width + 8 * unit;
+      const tagX = Math.max(0, Math.min(left, frame.width - tagWidth));
+      const tagY = Math.max(10 * unit, Math.min(top + 8 * unit, frame.height - 10 * unit));
+      context.fillStyle = color;
+      context.fillRect(tagX, tagY - 9 * unit, tagWidth, 18 * unit);
+      context.fillStyle = '#0d1117';
+      context.fillText(tag, tagX + 4 * unit, tagY);
+    });
+
+    const panelX = frame.width;
+    context.fillStyle = '#161b22';
+    context.fillRect(panelX, 0, panelWidth, canvas.height);
+    context.fillStyle = '#f0f6fc';
+    context.font = `bold ${14 * unit}px sans-serif`;
+    context.fillText(`Class 4 candidates (debug >= ${trace.debugThreshold})`, panelX + 12 * unit, 18 * unit);
+    context.font = `${11 * unit}px sans-serif`;
+    context.fillStyle = '#8b949e';
+    context.fillText('Boxes and centres use source-image pixels.', panelX + 12 * unit, 38 * unit);
+
+    orderedTrace.forEach((candidate, index) => {
+      const color = colorFor(candidate.disposition);
+      const y = panelTop + index * rowHeight;
+      context.fillStyle = color;
+      context.fillRect(panelX + 12 * unit, y - 5 * unit, 8 * unit, 8 * unit);
+      context.fillStyle = '#f0f6fc';
+      context.font = `${11 * unit}px sans-serif`;
+      const pointText = `(${candidate.point.x.toFixed(1)}, ${candidate.point.y.toFixed(1)})`;
+      const text =
+        `#${index + 1}  c=${candidate.confidence.toFixed(3)}  ` +
+        `${candidate.disposition}  ${pointText}`;
+      context.fillText(text, panelX + 26 * unit, y);
+    });
+  } else {
+    context.lineWidth = 2 * unit;
+    context.strokeStyle = 'rgba(248, 81, 73, 0.95)';
+    diagnostics.candidates.forEach((candidate, index) => {
+      const { x, y } = candidate.point;
+      context.beginPath();
+      context.arc(x, y, radius, 0, Math.PI * 2);
+      context.moveTo(x - radius * 1.7, y);
+      context.lineTo(x + radius * 1.7, y);
+      context.moveTo(x, y - radius * 1.7);
+      context.lineTo(x, y + radius * 1.7);
+      context.stroke();
+
+      const text = `#${index + 1} ${candidate.confidence === null ? 'n/a' : candidate.confidence.toFixed(2)}`;
+      const textX = x + radius * 1.9;
+      const textY = y - radius * 1.9;
+      const width = context.measureText(text).width;
+      context.fillStyle = 'rgba(0, 0, 0, 0.65)';
+      context.fillRect(textX, textY - 10 * unit, width + 8 * unit, 20 * unit);
+      context.fillStyle = '#ffdd57';
+      context.fillText(text, textX + 4 * unit, textY);
+    });
+  }
   context.restore();
 
   return await new Promise<Blob>((resolve, reject) => {

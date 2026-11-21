@@ -8,3 +8,5 @@ dist-ssr
 
 # Local ML sandbox for exporting/validating the dart detector. Never shipped.
 .ml-lab
+.debug-cases/
+dart-debug-case-*.json

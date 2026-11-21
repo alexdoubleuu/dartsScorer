@@ -62,6 +62,23 @@ export interface RawDetection {
   classId: number;
 }
 
+export type CandidateDisposition =
+  | 'below-confidence'
+  | 'other-class-wins'
+  | 'nms-suppressed'
+  | 'retained';
+
+export interface DartCandidateTrace extends RawDetection {
+  /** Anchor index in the model output tensor. */
+  anchor: number;
+  /** Best class for this anchor before class-4 filtering. */
+  winningClassId: number;
+  /** Why the normal production path did or did not retain this class-4 box. */
+  disposition: CandidateDisposition;
+  /** Higher-confidence class-4 anchor that suppressed this box, when applicable. */
+  suppressedByAnchor?: number;
+}
+
 export interface DecodeOptions {
   /** Total output rows: 4 box values plus one per class. */
   channels: number;
@@ -73,6 +90,82 @@ export interface DecodeOptions {
   confidenceThreshold: number;
   /** Intersection-over-union above which a weaker box is suppressed. */
   iouThreshold: number;
+}
+
+/**
+ * Trace class-4 boxes above a low debug threshold without changing production
+ * decoding. Each trace entry records the first production stage that excludes
+ * it, or confirms that it survives confidence filtering and class-wise NMS.
+ */
+export function traceDartCandidates(
+  output: Float32Array,
+  options: DecodeOptions,
+  dartClassId: number,
+  debugThreshold: number,
+): DartCandidateTrace[] {
+  const { channels, anchors, classCount, confidenceThreshold, iouThreshold } = options;
+  if (channels !== classCount + 4) {
+    throw new Error(`Output has ${channels} rows but ${classCount} classes need ${classCount + 4}.`);
+  }
+  if (output.length < channels * anchors) {
+    throw new Error(`Output has ${output.length} values, expected ${channels * anchors}.`);
+  }
+  if (dartClassId < 0 || dartClassId >= classCount) {
+    throw new Error(`Dart class ${dartClassId} is outside the ${classCount} model classes.`);
+  }
+
+  const candidates: DartCandidateTrace[] = [];
+  for (let anchor = 0; anchor < anchors; anchor += 1) {
+    const confidence = output[(4 + dartClassId) * anchors + anchor];
+    if (!Number.isFinite(confidence) || confidence < debugThreshold) continue;
+
+    let winningClassId = 0;
+    let winningConfidence = output[4 * anchors + anchor];
+    for (let classId = 1; classId < classCount; classId += 1) {
+      const score = output[(4 + classId) * anchors + anchor];
+      if (score > winningConfidence) {
+        winningConfidence = score;
+        winningClassId = classId;
+      }
+    }
+
+    candidates.push({
+      anchor,
+      cx: output[anchor],
+      cy: output[anchors + anchor],
+      width: output[2 * anchors + anchor],
+      height: output[3 * anchors + anchor],
+      confidence,
+      classId: dartClassId,
+      winningClassId,
+      disposition:
+        winningConfidence < confidenceThreshold
+          ? 'below-confidence'
+          : winningClassId !== dartClassId
+            ? 'other-class-wins'
+            : 'retained',
+    });
+  }
+
+  const eligible = candidates
+    .filter((candidate) => candidate.disposition === 'retained')
+    .sort((a, b) => b.confidence - a.confidence);
+  const kept: DartCandidateTrace[] = [];
+  for (const candidate of eligible) {
+    const suppressor = kept.find(
+      (previous) =>
+        previous.classId === candidate.classId &&
+        intersectionOverUnion(previous, candidate) > iouThreshold,
+    );
+    if (suppressor) {
+      candidate.disposition = 'nms-suppressed';
+      candidate.suppressedByAnchor = suppressor.anchor;
+    } else {
+      kept.push(candidate);
+    }
+  }
+
+  return candidates.sort((a, b) => a.anchor - b.anchor);
 }
 
 /**

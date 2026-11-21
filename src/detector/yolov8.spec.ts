@@ -5,6 +5,7 @@ import {
   letterboxGeometry,
   mapLetterboxedToSource,
   nonMaxSuppression,
+  traceDartCandidates,
   type RawDetection,
 } from './yolov8';
 
@@ -174,6 +175,44 @@ describe('decodeYolov8', () => {
         iouThreshold: 0.5,
       }),
     ).toThrow(/rows/);
+  });
+});
+
+describe('traceDartCandidates', () => {
+  it('reports confidence, class-selection, NMS, and retained outcomes', () => {
+    const classCount = 7;
+    const output = buildOutput(
+      [
+        { box: [40, 40, 20, 20], scores: [0, 0, 0, 0, 0.2, 0, 0] },
+        { box: [80, 80, 20, 20], scores: [0.9, 0, 0, 0, 0.4, 0, 0] },
+        { box: [120, 120, 20, 20], scores: [0, 0, 0, 0, 0.8, 0, 0] },
+        { box: [121, 121, 20, 20], scores: [0, 0, 0, 0, 0.7, 0, 0] },
+      ],
+      classCount,
+    );
+    const trace = traceDartCandidates(
+      output,
+      {
+        channels: 4 + classCount,
+        anchors: 4,
+        classCount,
+        confidenceThreshold: 0.25,
+        iouThreshold: 0.5,
+      },
+      4,
+      0.01,
+    );
+
+    expect(trace).toHaveLength(4);
+    expect(trace.map(({ disposition }) => disposition)).toEqual([
+      'below-confidence',
+      'other-class-wins',
+      'retained',
+      'nms-suppressed',
+    ]);
+    expect(trace[3].suppressedByAnchor).toBe(2);
+    expect(trace[1].confidence).toBeCloseTo(0.4, 6);
+    expect(trace[1].winningClassId).toBe(0);
   });
 });
 
